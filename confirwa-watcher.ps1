@@ -1,6 +1,6 @@
 param(
     [string] $StateFile = "",
-    [string] $ImageDir = "",
+    [string] $ImageDir = "D:\EdgeDownload\chiikawa",
     [double] $IdleSeconds = 1.5,
     [int] $PollMs = 400
 )
@@ -9,9 +9,6 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($StateFile)) {
     $StateFile = Join-Path $env:USERPROFILE ".cache\confirwa.state"
-}
-if ([string]::IsNullOrWhiteSpace($ImageDir)) {
-    $ImageDir = Join-Path $PSScriptRoot "images"
 }
 
 function Ensure-ParentDir {
@@ -550,9 +547,12 @@ function Is-ApprovalSignal {
         if ($s -match '"requires_approval"\s*:\s*true') { return $true }
         if ($s -match '"require_escalated"') { return $true }
         if ($s -match '"approval_request"') { return $true }
-        if ($s -match '\bproceed\b') { return $true }
-        if ($s -match 'approve[^\r\n]{0,40}proceed') { return $true }
-        if ($s -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)') { return $true }
+        if ($s -match 'do you want me to proceed') { return $true }
+        if ($s -match 'want me to proceed') { return $true }
+        if ($s -match 'can i proceed') { return $true }
+        if ($s -match 'may i proceed') { return $true }
+        if ($s -match 'should i proceed') { return $true }
+        if ($s -match 'proceed\?') { return $true }
     }
 
     return $false
@@ -674,9 +674,12 @@ function Parse-SessionLine {
     $hasApprovalHint = ($Line -match '"requires_approval"\s*:\s*true' -or
                         $Line -match '"require_escalated"' -or
                         $Line -match '"approval_request"' -or
-                        $Line -match '\bproceed\b' -or
-                        $Line -match 'approve[^\r\n]{0,40}proceed' -or
-                        $Line -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)')
+                        $Line -match 'do you want me to proceed' -or
+                        $Line -match 'want me to proceed' -or
+                        $Line -match 'can i proceed' -or
+                        $Line -match 'may i proceed' -or
+                        $Line -match 'should i proceed' -or
+                        $Line -match 'proceed\?')
 
     if (-not $isEventMsg -and -not $isResponseItem) {
         if (Is-ReconnectingSignal -Obj $null -Line $Line) {
@@ -1084,7 +1087,7 @@ function Get-CardModels {
     $usedPath = @{}
     $seenTitle = @{}
 
-    # first pass: prefer distinct directory titles
+    # first pass: prefer different opened directories so 3S/cal are separated
     foreach ($info in $orderedInfos) {
         $title = [string]$info.Title
         if ([string]::IsNullOrWhiteSpace($title)) { $title = "codex" }
