@@ -2,6 +2,12 @@
 
 Lightweight Windows PowerShell watcher that shows one borderless GIF card per active Codex agent.
 
+## Preview
+
+Agent directory names are mosaiced in this screenshot:
+
+![confirwa redacted preview](images/confirwa-redacted.png)
+
 ## What It Does
 - Creates one floating card per detected Codex agent process.
 - Reads local Codex session logs to infer per-agent state.
