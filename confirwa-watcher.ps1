@@ -550,6 +550,7 @@ function Is-ApprovalSignal {
         if ($s -match '"requires_approval"\s*:\s*true') { return $true }
         if ($s -match '"require_escalated"') { return $true }
         if ($s -match '"approval_request"') { return $true }
+        if ($s -match '\bproceed\b') { return $true }
         if ($s -match 'approve[^\r\n]{0,40}proceed') { return $true }
         if ($s -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)') { return $true }
     }
@@ -673,6 +674,7 @@ function Parse-SessionLine {
     $hasApprovalHint = ($Line -match '"requires_approval"\s*:\s*true' -or
                         $Line -match '"require_escalated"' -or
                         $Line -match '"approval_request"' -or
+                        $Line -match '\bproceed\b' -or
                         $Line -match 'approve[^\r\n]{0,40}proceed' -or
                         $Line -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)')
 
