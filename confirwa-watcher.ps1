@@ -550,6 +550,8 @@ function Is-ApprovalSignal {
         if ($s -match '"requires_approval"\s*:\s*true') { return $true }
         if ($s -match '"require_escalated"') { return $true }
         if ($s -match '"approval_request"') { return $true }
+        if ($s -match 'approve[^\r\n]{0,40}proceed') { return $true }
+        if ($s -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)') { return $true }
     }
 
     return $false
@@ -670,7 +672,9 @@ function Parse-SessionLine {
     $isFunctionCall = ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"function_call"')
     $hasApprovalHint = ($Line -match '"requires_approval"\s*:\s*true' -or
                         $Line -match '"require_escalated"' -or
-                        $Line -match '"approval_request"')
+                        $Line -match '"approval_request"' -or
+                        $Line -match 'approve[^\r\n]{0,40}proceed' -or
+                        $Line -match 'proceed[^\r\n]{0,40}(approve|approval|permission|allow)')
 
     if (-not $isEventMsg -and -not $isResponseItem) {
         if (Is-ReconnectingSignal -Obj $null -Line $Line) {
