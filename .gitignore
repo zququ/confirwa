@@ -1,0 +1,10 @@
+# Ignore local runtime files
+.cache/
+*.pid
+*.log
+
+# Ignore local editor/system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
