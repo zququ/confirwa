@@ -290,6 +290,7 @@ function Ensure-SessionStatus {
             LastEventUtc = [DateTime]::MinValue
             LastApprovalUtc = [DateTime]::MinValue
             LastReconnectUtc = [DateTime]::MinValue
+            ApprovalPending = $false
             ActiveTurns = @{}
         }
     }
@@ -321,12 +322,22 @@ function Mark-SessionEvent {
         if ($when -gt $script:sessionStatus[$Path].LastApprovalUtc) {
             $script:sessionStatus[$Path].LastApprovalUtc = $when
         }
+        $script:sessionStatus[$Path].ApprovalPending = $true
     }
     if ($Reconnecting) {
         if ($when -gt $script:sessionStatus[$Path].LastReconnectUtc) {
             $script:sessionStatus[$Path].LastReconnectUtc = $when
         }
     }
+}
+
+function Clear-SessionApprovalPending {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    Ensure-SessionStatus -Path $Path
+    $script:sessionStatus[$Path].ApprovalPending = $false
 }
 
 function Get-EventTimestampUtc {
@@ -547,6 +558,10 @@ function Is-ApprovalSignal {
         if ($s -match '"requires_approval"\s*:\s*true') { return $true }
         if ($s -match '"require_escalated"') { return $true }
         if ($s -match '"approval_request"') { return $true }
+        if ($s -match 'yes,\s*proceed\s*\(y\)') { return $true }
+        if ($s -match '^\s*[›>]*\s*1\.\s*yes,\s*proceed\s*\(y\)') { return $true }
+        if ($s -match '^\s*[2２]\.\s*yes,\s*and\s*don''t ask again') { return $true }
+        if ($s -match '\(\s*y\s*\)' -and $s -match 'yes' -and $s -match 'proceed') { return $true }
         if ($s -match 'do you want me to proceed') { return $true }
         if ($s -match 'want me to proceed') { return $true }
         if ($s -match 'can i proceed') { return $true }
@@ -629,30 +644,35 @@ function Update-SessionTurnStateFromLine {
     switch ($eventType) {
         "task_started" {
             $turns[$turnId] = $AtUtc
+            Clear-SessionApprovalPending -Path $Path
             break
         }
         "task_complete" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
             }
+            Clear-SessionApprovalPending -Path $Path
             break
         }
         "turn_aborted" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
             }
+            Clear-SessionApprovalPending -Path $Path
             break
         }
         "task_failed" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
             }
+            Clear-SessionApprovalPending -Path $Path
             break
         }
         "task_cancelled" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
             }
+            Clear-SessionApprovalPending -Path $Path
             break
         }
     }
@@ -671,15 +691,23 @@ function Parse-SessionLine {
     $isEventMsg = ($Line -match '"type"\s*:\s*"event_msg"')
     $isResponseItem = ($Line -match '"type"\s*:\s*"response_item"')
     $isFunctionCall = ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"function_call"')
+    $isFunctionCallOutput = ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(function_call_output|custom_tool_call_output)"')
     $hasApprovalHint = ($Line -match '"requires_approval"\s*:\s*true' -or
                         $Line -match '"require_escalated"' -or
                         $Line -match '"approval_request"' -or
+                        $Line -match 'yes,\s*proceed\s*\(y\)' -or
+                        $Line -match '^\s*[›>]*\s*1\.\s*yes,\s*proceed\s*\(y\)' -or
+                        $Line -match '\(\s*y\s*\)' -or
                         $Line -match 'do you want me to proceed' -or
                         $Line -match 'want me to proceed' -or
                         $Line -match 'can i proceed' -or
                         $Line -match 'may i proceed' -or
                         $Line -match 'should i proceed' -or
                         $Line -match 'proceed\?')
+
+    if ($isFunctionCallOutput) {
+        Clear-SessionApprovalPending -Path $Path
+    }
 
     if (-not $isEventMsg -and -not $isResponseItem) {
         if (Is-ReconnectingSignal -Obj $null -Line $Line) {
@@ -957,6 +985,7 @@ function Get-SessionStateInfo {
 
     $now = [DateTime]::UtcNow
     $approvalHoldSec = [Math]::Max(90.0, $IdleSeconds * 20.0)
+    $approvalPendingMaxSec = [Math]::Max(21600.0, $IdleSeconds * 14400.0)
     $reconnectHoldSec = [Math]::Max(30.0, $IdleSeconds * 18.0)
     $runningWindowSec = [Math]::Max(30.0, $IdleSeconds * 20.0)
     $status = $null
@@ -991,6 +1020,17 @@ function Get-SessionStateInfo {
     $age = ($now - $lastSignal).TotalSeconds
     if ($age -lt 0) {
         $age = 0
+    }
+
+    if ($status -and $status.ApprovalPending) {
+        $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
+        if ($writeAgeSec -le $approvalPendingMaxSec) {
+            return [PSCustomObject]@{
+                State = "approval"
+                AgeSec = [int][Math]::Floor([Math]::Max(0.0, $approvalAge))
+            }
+        }
+        $status.ApprovalPending = $false
     }
 
     if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue) {
