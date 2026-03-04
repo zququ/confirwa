@@ -527,6 +527,21 @@ function Is-ApprovalCall {
     return $sp -eq "require_escalated"
 }
 
+function Is-ApprovalMenuLine {
+    param([string] $Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $false
+    }
+
+    $s = $Line.ToLowerInvariant().Trim()
+    if ($s -match '^[›>]*\s*1\.\s*yes,\s*proceed\s*\(y\)(\s|$)') {
+        return $true
+    }
+
+    return $false
+}
+
 function Is-ApprovalSignal {
     param(
         $Obj,
@@ -558,16 +573,7 @@ function Is-ApprovalSignal {
         if ($s -match '"requires_approval"\s*:\s*true') { return $true }
         if ($s -match '"require_escalated"') { return $true }
         if ($s -match '"approval_request"') { return $true }
-        if ($s -match 'yes,\s*proceed\s*\(y\)') { return $true }
-        if ($s -match '^\s*[›>]*\s*1\.\s*yes,\s*proceed\s*\(y\)') { return $true }
-        if ($s -match '^\s*[2２]\.\s*yes,\s*and\s*don''t ask again') { return $true }
-        if ($s -match '\(\s*y\s*\)' -and $s -match 'yes' -and $s -match 'proceed') { return $true }
-        if ($s -match 'do you want me to proceed') { return $true }
-        if ($s -match 'want me to proceed') { return $true }
-        if ($s -match 'can i proceed') { return $true }
-        if ($s -match 'may i proceed') { return $true }
-        if ($s -match 'should i proceed') { return $true }
-        if ($s -match 'proceed\?') { return $true }
+        if (Is-ApprovalMenuLine -Line $Line) { return $true }
     }
 
     return $false
@@ -692,29 +698,20 @@ function Parse-SessionLine {
     $isResponseItem = ($Line -match '"type"\s*:\s*"response_item"')
     $isFunctionCall = ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"function_call"')
     $isFunctionCallOutput = ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(function_call_output|custom_tool_call_output)"')
-    $hasApprovalHint = ($Line -match '"requires_approval"\s*:\s*true' -or
-                        $Line -match '"require_escalated"' -or
-                        $Line -match '"approval_request"' -or
-                        $Line -match 'yes,\s*proceed\s*\(y\)' -or
-                        $Line -match '^\s*[›>]*\s*1\.\s*yes,\s*proceed\s*\(y\)' -or
-                        $Line -match '\(\s*y\s*\)' -or
-                        $Line -match 'do you want me to proceed' -or
-                        $Line -match 'want me to proceed' -or
-                        $Line -match 'can i proceed' -or
-                        $Line -match 'may i proceed' -or
-                        $Line -match 'should i proceed' -or
-                        $Line -match 'proceed\?')
+    $approvalFromLine = Is-ApprovalSignal -Obj $null -Line $Line
+    $hasApprovalHint = $approvalFromLine
+    $reconnectFromLine = Is-ReconnectingSignal -Obj $null -Line $Line
 
     if ($isFunctionCallOutput) {
         Clear-SessionApprovalPending -Path $Path
     }
 
     if (-not $isEventMsg -and -not $isResponseItem) {
-        if (Is-ReconnectingSignal -Obj $null -Line $Line) {
+        if ($reconnectFromLine) {
             Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
             return
         }
-        if (Is-ApprovalSignal -Obj $null -Line $Line) {
+        if ($approvalFromLine) {
             Mark-SessionEvent -Path $Path -Approval -AtUtc $eventUtc
             return
         }
@@ -724,12 +721,12 @@ function Parse-SessionLine {
     if ($isEventMsg) {
         Update-SessionTurnStateFromLine -Path $Path -Line $Line -AtUtc $eventUtc
 
-        if (Is-ApprovalSignal -Obj $null -Line $Line) {
+        if ($approvalFromLine) {
             Mark-SessionEvent -Path $Path -Approval -AtUtc $eventUtc
             return
         }
 
-        if (Is-ReconnectingSignal -Obj $null -Line $Line) {
+        if ($reconnectFromLine) {
             Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
             return
         }
@@ -739,13 +736,13 @@ function Parse-SessionLine {
     }
 
     if ($isFunctionCall -or $hasApprovalHint) {
-        if (Is-ApprovalSignal -Obj $null -Line $Line) {
+        if ($approvalFromLine) {
             Mark-SessionEvent -Path $Path -Approval -AtUtc $eventUtc
             return
         }
     }
 
-    if (Is-ReconnectingSignal -Obj $null -Line $Line) {
+    if ($reconnectFromLine) {
         Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
         return
     }
@@ -866,6 +863,9 @@ function Initialize-SessionFromTail {
                 $latestEventUtc = $eventUtc
             }
 
+            if ($line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(function_call_output|custom_tool_call_output)"') {
+                Clear-SessionApprovalPending -Path $Path
+            }
             if (Is-ApprovalSignal -Obj $null -Line $line) {
                 Mark-SessionEvent -Path $Path -Approval -AtUtc $eventUtc
             }
@@ -892,6 +892,7 @@ function Initialize-SessionFromTail {
             if ($line.IndexOf('"payload":{"type":"task_started"', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                 $line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"task_started"') {
                 $turns[$turnId] = $eventUtc
+                Clear-SessionApprovalPending -Path $Path
                 continue
             }
 
@@ -903,6 +904,7 @@ function Initialize-SessionFromTail {
                 if ($turns.ContainsKey($turnId)) {
                     $turns.Remove($turnId) | Out-Null
                 }
+                Clear-SessionApprovalPending -Path $Path
                 continue
             }
         }
