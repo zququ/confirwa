@@ -1024,11 +1024,7 @@ function Get-SessionStateInfo {
 
     if ($status -and $status.ApprovalPending) {
         $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
-        $hasPostApprovalProgress = ($status.LastEventUtc -gt $status.LastApprovalUtc -and $age -le $runningWindowSec)
-        if ($hasPostApprovalProgress) {
-            # approval has been resolved and the agent resumed output
-            $status.ApprovalPending = $false
-        } elseif ($writeAgeSec -le $approvalPendingMaxSec) {
+        if ($writeAgeSec -le $approvalPendingMaxSec) {
             return [PSCustomObject]@{
                 State = "approval"
                 AgeSec = [int][Math]::Floor([Math]::Max(0.0, $approvalAge))
