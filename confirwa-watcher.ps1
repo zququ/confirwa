@@ -1024,22 +1024,17 @@ function Get-SessionStateInfo {
 
     if ($status -and $status.ApprovalPending) {
         $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
-        if ($writeAgeSec -le $approvalPendingMaxSec) {
+        $hasPostApprovalProgress = ($status.LastEventUtc -gt $status.LastApprovalUtc -and $age -le $runningWindowSec)
+        if ($hasPostApprovalProgress) {
+            # approval has been resolved and the agent resumed output
+            $status.ApprovalPending = $false
+        } elseif ($writeAgeSec -le $approvalPendingMaxSec) {
             return [PSCustomObject]@{
                 State = "approval"
                 AgeSec = [int][Math]::Floor([Math]::Max(0.0, $approvalAge))
             }
-        }
-        $status.ApprovalPending = $false
-    }
-
-    if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue) {
-        $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
-        if ($approvalAge -le $approvalHoldSec) {
-            return [PSCustomObject]@{
-                State = "approval"
-                AgeSec = [int][Math]::Floor([Math]::Max(0.0, $approvalAge))
-            }
+        } else {
+            $status.ApprovalPending = $false
         }
     }
 
@@ -1049,6 +1044,16 @@ function Get-SessionStateInfo {
             return [PSCustomObject]@{
                 State = "reconnecting"
                 AgeSec = [int][Math]::Floor([Math]::Max(0.0, $reconnectAge))
+            }
+        }
+    }
+
+    if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue -and -not $hasActiveTurn) {
+        $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
+        if ($approvalAge -le $approvalHoldSec) {
+            return [PSCustomObject]@{
+                State = "approval"
+                AgeSec = [int][Math]::Floor([Math]::Max(0.0, $approvalAge))
             }
         }
     }
