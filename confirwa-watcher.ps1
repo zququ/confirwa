@@ -419,7 +419,12 @@ function Refresh-ReconnectSignalsFromCodexLogs {
 
         $msg = ""
         try { $msg = [string]$obj.message } catch { $msg = "" }
-        if (-not (Is-ReconnectTextLikeBark -Line $msg)) {
+        $isReconnectRecovered = Is-ReconnectRecoveredTextLikeBark -Line $msg
+        $isReconnect = $false
+        if (-not $isReconnectRecovered) {
+            $isReconnect = Is-ReconnectTextLikeBark -Line $msg
+        }
+        if (-not $isReconnect -and -not $isReconnectRecovered) {
             continue
         }
 
@@ -444,6 +449,12 @@ function Refresh-ReconnectSignalsFromCodexLogs {
             }
         }
         if (([DateTime]::UtcNow - $atUtc).TotalSeconds -gt 300.0) {
+            continue
+        }
+
+        if ($isReconnectRecovered) {
+            Clear-SessionReconnectPending -Path $path
+            Mark-SessionEvent -Path $path -AtUtc $atUtc
             continue
         }
 
@@ -876,9 +887,12 @@ function Ensure-SessionStatus {
             LastEventUtc = [DateTime]::MinValue
             LastApprovalUtc = [DateTime]::MinValue
             LastReconnectUtc = [DateTime]::MinValue
+            LastWorkUtc = [DateTime]::MinValue
+            LastTerminalUtc = [DateTime]::MinValue
             LastSpeechUtc = [DateTime]::MinValue
             LastSpeechText = ""
             ApprovalPending = $false
+            ReconnectPending = $false
             ActiveTurns = @{}
         }
     }
@@ -911,11 +925,63 @@ function Mark-SessionEvent {
             $script:sessionStatus[$Path].LastApprovalUtc = $when
         }
         $script:sessionStatus[$Path].ApprovalPending = $true
+        $script:sessionStatus[$Path].ReconnectPending = $false
     }
     if ($Reconnecting) {
         if ($when -gt $script:sessionStatus[$Path].LastReconnectUtc) {
             $script:sessionStatus[$Path].LastReconnectUtc = $when
         }
+        $script:sessionStatus[$Path].ReconnectPending = $true
+    }
+}
+
+function Mark-SessionWork {
+    param(
+        [string] $Path,
+        [DateTime] $AtUtc = [DateTime]::MinValue
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    Ensure-SessionStatus -Path $Path
+
+    $when = $AtUtc
+    if ($when -eq [DateTime]::MinValue) {
+        $when = [DateTime]::UtcNow
+    } else {
+        $when = $when.ToUniversalTime()
+    }
+
+    if ($when -gt $script:sessionStatus[$Path].LastWorkUtc) {
+        $script:sessionStatus[$Path].LastWorkUtc = $when
+    }
+    if ($when -gt $script:sessionStatus[$Path].LastEventUtc) {
+        $script:sessionStatus[$Path].LastEventUtc = $when
+    }
+}
+
+function Mark-SessionTerminal {
+    param(
+        [string] $Path,
+        [DateTime] $AtUtc = [DateTime]::MinValue
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    Ensure-SessionStatus -Path $Path
+
+    $when = $AtUtc
+    if ($when -eq [DateTime]::MinValue) {
+        $when = [DateTime]::UtcNow
+    } else {
+        $when = $when.ToUniversalTime()
+    }
+
+    if ($when -gt $script:sessionStatus[$Path].LastTerminalUtc) {
+        $script:sessionStatus[$Path].LastTerminalUtc = $when
+    }
+    if ($when -gt $script:sessionStatus[$Path].LastEventUtc) {
+        $script:sessionStatus[$Path].LastEventUtc = $when
     }
 }
 
@@ -926,6 +992,15 @@ function Clear-SessionApprovalPending {
     }
     Ensure-SessionStatus -Path $Path
     $script:sessionStatus[$Path].ApprovalPending = $false
+}
+
+function Clear-SessionReconnectPending {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    Ensure-SessionStatus -Path $Path
+    $script:sessionStatus[$Path].ReconnectPending = $false
 }
 
 function Clear-SessionActiveTurns {
@@ -945,6 +1020,59 @@ function Is-FinalAnswerSignal {
     $s = $Line.ToLowerInvariant()
     if ($s -match '"phase"\s*:\s*"final_answer"') { return $true }
     if ($s -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"task_complete"') { return $true }
+    return $false
+}
+
+function Is-TerminalActivitySignal {
+    param(
+        $Obj,
+        [string] $Line
+    )
+
+    if (Is-FinalAnswerSignal -Line $Line) {
+        return $true
+    }
+    if (-not $Obj) {
+        return $false
+    }
+
+    $type = ""
+    try { $type = [string]$Obj.type } catch { $type = "" }
+    if ($type -ne "event_msg") {
+        return $false
+    }
+
+    $eventType = ""
+    try { $eventType = [string]$Obj.payload.type } catch { $eventType = "" }
+    return ($eventType -match "^(task_complete|turn_aborted|task_failed|task_cancelled)$")
+}
+
+function Is-WorkActivitySignal {
+    param($Obj)
+
+    if (-not $Obj) {
+        return $false
+    }
+
+    $type = ""
+    try { $type = [string]$Obj.type } catch { $type = "" }
+    if ($type -eq "event_msg") {
+        $eventType = ""
+        try { $eventType = [string]$Obj.payload.type } catch { $eventType = "" }
+        return ($eventType -match "^(task_started|agent_message|approval_request|requires_approval)$")
+    }
+    if ($type -eq "response_item") {
+        $payloadType = ""
+        $role = ""
+        try { $payloadType = [string]$Obj.payload.type } catch { $payloadType = "" }
+        try { $role = [string]$Obj.payload.role } catch { $role = "" }
+        if (($payloadType -eq "message" -and $role -eq "assistant") -or
+            $payloadType -eq "function_call" -or
+            $payloadType -eq "function_call_output" -or
+            $payloadType -eq "custom_tool_call_output") {
+            return $true
+        }
+    }
     return $false
 }
 
@@ -991,10 +1119,16 @@ function Normalize-SpeechText {
     return $s
 }
 
-function Get-FirstSentenceText {
-    param([string] $Text)
+function Get-FirstSentencesText {
+    param(
+        [string] $Text,
+        [int] $SentenceCount = 2
+    )
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+    if ($SentenceCount -le 0) {
         return ""
     }
 
@@ -1014,9 +1148,25 @@ function Get-FirstSentenceText {
         return ""
     }
 
-    $m = [regex]::Match($firstLine, '^.*?(。|！|？|\.|!|\?)')
-    if ($m.Success) {
-        return $m.Value.Trim()
+    $matches = [regex]::Matches($firstLine, '[^。！？.!?]+[。！？.!?]?')
+    $parts = @()
+    foreach ($m in $matches) {
+        $seg = [string]$m.Value
+        if ([string]::IsNullOrWhiteSpace($seg)) {
+            continue
+        }
+        $seg = $seg.Trim()
+        if ($seg.Length -le 0) {
+            continue
+        }
+        $parts += $seg
+        if ($parts.Count -ge $SentenceCount) {
+            break
+        }
+    }
+
+    if ($parts.Count -gt 0) {
+        return ([string]::Join(" ", $parts)).Trim()
     }
     return $firstLine.Trim()
 }
@@ -1101,9 +1251,9 @@ function Get-SessionSpeechPreview {
     if ($script:sessionStatus.ContainsKey($Path)) {
         $t = [string]$script:sessionStatus[$Path].LastSpeechText
         if (-not [string]::IsNullOrWhiteSpace($t)) {
-            $one = Get-FirstSentenceText -Text $t
-            if (-not [string]::IsNullOrWhiteSpace($one)) {
-                return $one
+            $preview = Get-FirstSentencesText -Text $t -SentenceCount 1
+            if (-not [string]::IsNullOrWhiteSpace($preview)) {
+                return $preview
             }
         }
     }
@@ -1397,6 +1547,45 @@ function Is-ReconnectTextLikeBark {
     return $false
 }
 
+function Is-ReconnectRecoveredTextLikeBark {
+    param([string] $Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $false
+    }
+
+    $low = $Line.ToLowerInvariant()
+    if ($low -match 'failed to reconnect' -or
+        $low -match 'reconnect failed' -or
+        $low -match 'connection lost' -or
+        $low -match 'stream disconnected') {
+        return $false
+    }
+
+    if ($low -match 'connection restored' -or
+        $low -match 'reconnected' -or
+        $low -match 'reconnect succeeded' -or
+        $low -match 'reconnect successful' -or
+        $low -match 'reconnect complete' -or
+        $low -match 'retry succeeded' -or
+        $low -match 'retry successful' -or
+        $low -match 'stream resumed' -or
+        $low -match 'back online') {
+        return $true
+    }
+
+    $flat = ($low -replace '[\s\-]+', '')
+    if ($flat -match 'connectionrestored' -or
+        $flat -match 'reconnectedsuccess' -or
+        $flat -match 'reconnectsucceeded' -or
+        $flat -match 'streamresumed' -or
+        $flat -match 'retrysucceeded') {
+        return $true
+    }
+
+    return $false
+}
+
 function Is-ApprovalSignal {
     param(
         $Obj,
@@ -1466,7 +1655,7 @@ function Is-ReconnectingSignal {
             } catch {
                 $pType = ""
             }
-            if ($pType -match "reconnect|reconnecting|connection_lost|connection_restored") {
+            if ($pType -match "reconnect|reconnecting|connection_lost") {
                 return $true
             }
             $msg = ""
@@ -1474,6 +1663,9 @@ function Is-ReconnectingSignal {
                 $msg = [string]$Obj.payload.message
             } catch {
                 $msg = ""
+            }
+            if (-not [string]::IsNullOrWhiteSpace($msg) -and (Is-ReconnectRecoveredTextLikeBark -Line $msg)) {
+                return $false
             }
             if (-not [string]::IsNullOrWhiteSpace($msg) -and (Is-ReconnectTextLikeBark -Line $msg)) {
                 return $true
@@ -1485,13 +1677,99 @@ function Is-ReconnectingSignal {
         $s = $Line.ToLowerInvariant()
         $trim = $Line.TrimStart()
         $isJsonRecord = $trim.StartsWith("{")
+        if (Is-ReconnectRecoveredTextLikeBark -Line $Line) { return $false }
         if ($isJsonRecord) {
             if ($s -match '"type"\s*:\s*"event_msg"' -and
-                $s -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(reconnect|reconnecting|connection_lost|connection_restored)"') { return $true }
+                $s -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(reconnect|reconnecting|connection_lost)"') { return $true }
             if ($s -match '"type"\s*:\s*"event_msg"' -and
                 ($s -match 'stream disconnected' -or $s -match 'retrying turn' -or $s -match 'retrying sampling request' -or $s -match 'connection lost' -or $s -match 'connection closed' -or $s -match 'connection dropped')) { return $true }
         } else {
             if (Is-ReconnectTextLikeBark -Line $Line) { return $true }
+        }
+    }
+
+    return $false
+}
+
+function Is-ReconnectRecoveredSignal {
+    param(
+        $Obj,
+        [string] $Line
+    )
+
+    if ($Obj) {
+        $type = [string]$Obj.type
+        if ($type -eq "event_msg") {
+            $pType = ""
+            try {
+                $pType = [string]$Obj.payload.type
+            } catch {
+                $pType = ""
+            }
+            if ($pType -match "connection_restored|reconnected|reconnect_succeeded|reconnect_successful|stream_resumed|retry_succeeded") {
+                return $true
+            }
+            $msg = ""
+            try {
+                $msg = [string]$Obj.payload.message
+            } catch {
+                $msg = ""
+            }
+            if (-not [string]::IsNullOrWhiteSpace($msg) -and (Is-ReconnectRecoveredTextLikeBark -Line $msg)) {
+                return $true
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Line)) {
+        $s = $Line.ToLowerInvariant()
+        $trim = $Line.TrimStart()
+        $isJsonRecord = $trim.StartsWith("{")
+        if ($isJsonRecord) {
+            if ($s -match '"type"\s*:\s*"event_msg"' -and
+                $s -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(connection_restored|reconnected|reconnect_succeeded|reconnect_successful|stream_resumed|retry_succeeded)"') { return $true }
+        }
+        if (Is-ReconnectRecoveredTextLikeBark -Line $Line) { return $true }
+    }
+
+    return $false
+}
+
+function Is-ReconnectClearActivity {
+    param(
+        $Obj,
+        [string] $Line
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Line)) {
+        if ($Line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(function_call_output|custom_tool_call_output)"') {
+            return $true
+        }
+    }
+
+    if (-not $Obj) {
+        return $false
+    }
+
+    $type = [string]$Obj.type
+    if ($type -eq "response_item") {
+        $payloadType = ""
+        $role = ""
+        try { $payloadType = [string]$Obj.payload.type } catch { $payloadType = "" }
+        try { $role = [string]$Obj.payload.role } catch { $role = "" }
+        if ($payloadType -eq "message" -and $role -eq "assistant") {
+            return $true
+        }
+        if ($payloadType -eq "function_call_output" -or $payloadType -eq "custom_tool_call_output") {
+            return $true
+        }
+    }
+
+    if ($type -eq "event_msg") {
+        $eventType = ""
+        try { $eventType = [string]$Obj.payload.type } catch { $eventType = "" }
+        if ($eventType -match "task_started|task_complete|turn_aborted|task_failed|task_cancelled|agent_message|approval_request|requires_approval") {
+            return $true
         }
     }
 
@@ -1532,8 +1810,8 @@ function Update-SessionTurnStateFromLine {
 
     if ([string]::IsNullOrWhiteSpace($turnId)) {
         if ($eventType -eq "task_complete" -or $eventType -eq "turn_aborted" -or $eventType -eq "task_failed" -or $eventType -eq "task_cancelled") {
-            Clear-SessionActiveTurns -Path $Path
             Clear-SessionApprovalPending -Path $Path
+            Clear-SessionReconnectPending -Path $Path
         }
         return
     }
@@ -1541,42 +1819,39 @@ function Update-SessionTurnStateFromLine {
     switch ($eventType) {
         "task_started" {
             $turns[$turnId] = $AtUtc
+            Clear-SessionReconnectPending -Path $Path
             break
         }
         "task_complete" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
-            } else {
-                Clear-SessionActiveTurns -Path $Path
             }
             Clear-SessionApprovalPending -Path $Path
+            Clear-SessionReconnectPending -Path $Path
             break
         }
         "turn_aborted" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
-            } else {
-                Clear-SessionActiveTurns -Path $Path
             }
             Clear-SessionApprovalPending -Path $Path
+            Clear-SessionReconnectPending -Path $Path
             break
         }
         "task_failed" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
-            } else {
-                Clear-SessionActiveTurns -Path $Path
             }
             Clear-SessionApprovalPending -Path $Path
+            Clear-SessionReconnectPending -Path $Path
             break
         }
         "task_cancelled" {
             if ($turns.ContainsKey($turnId)) {
                 $turns.Remove($turnId) | Out-Null
-            } else {
-                Clear-SessionActiveTurns -Path $Path
             }
             Clear-SessionApprovalPending -Path $Path
+            Clear-SessionReconnectPending -Path $Path
             break
         }
     }
@@ -1611,8 +1886,14 @@ function Parse-SessionLine {
 
     $approvalFromLine = Is-ApprovalSignal -Obj $obj -Line $Line
     $hasApprovalHint = $approvalFromLine
-    $reconnectFromLine = Is-ReconnectingSignal -Obj $obj -Line $Line
+    $reconnectRecoveredFromLine = Is-ReconnectRecoveredSignal -Obj $obj -Line $Line
+    $reconnectFromLine = $false
+    if (-not $reconnectRecoveredFromLine) {
+        $reconnectFromLine = Is-ReconnectingSignal -Obj $obj -Line $Line
+    }
     $isFinalAnswer = Is-FinalAnswerSignal -Line $Line
+    $isTerminalActivity = Is-TerminalActivitySignal -Obj $obj -Line $Line
+    $isWorkActivity = Is-WorkActivitySignal -Obj $obj
 
     # Approval should clear only when we see real resumed assistant output after the approval event.
     if ($script:sessionStatus.ContainsKey($Path)) {
@@ -1646,17 +1927,45 @@ function Parse-SessionLine {
                 Clear-SessionApprovalPending -Path $Path
             }
         }
+
+        $isAfterReconnect = $false
+        try {
+            $isAfterReconnect = ($st.LastReconnectUtc -ne [DateTime]::MinValue -and $eventUtc -gt $st.LastReconnectUtc)
+        } catch {
+            $isAfterReconnect = $false
+        }
+        if ($st.ReconnectPending -and $isAfterReconnect) {
+            $clearReconnect = $reconnectRecoveredFromLine
+            if (-not $clearReconnect -and -not $reconnectFromLine) {
+                $clearReconnect = Is-ReconnectClearActivity -Obj $obj -Line $Line
+            }
+            if ($clearReconnect) {
+                Clear-SessionReconnectPending -Path $Path
+            }
+        }
     }
 
     if ($isFunctionCallOutput) {
         Clear-SessionApprovalPending -Path $Path
+        Clear-SessionReconnectPending -Path $Path
+    }
+    if ($isTerminalActivity) {
+        Mark-SessionTerminal -Path $Path -AtUtc $eventUtc
     }
     if ($isFinalAnswer) {
         Clear-SessionActiveTurns -Path $Path
         Clear-SessionApprovalPending -Path $Path
+        Clear-SessionReconnectPending -Path $Path
+    } elseif ($isWorkActivity) {
+        Mark-SessionWork -Path $Path -AtUtc $eventUtc
     }
 
     if (-not $isEventMsg -and -not $isResponseItem) {
+        if ($reconnectRecoveredFromLine) {
+            Clear-SessionReconnectPending -Path $Path
+            Mark-SessionEvent -Path $Path -AtUtc $eventUtc
+            return
+        }
         if ($reconnectFromLine) {
             Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
             return
@@ -1676,6 +1985,12 @@ function Parse-SessionLine {
             return
         }
 
+        if ($reconnectRecoveredFromLine) {
+            Clear-SessionReconnectPending -Path $Path
+            Mark-SessionEvent -Path $Path -AtUtc $eventUtc
+            return
+        }
+
         if ($reconnectFromLine) {
             Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
             return
@@ -1692,6 +2007,9 @@ function Parse-SessionLine {
         }
     }
 
+    if ($reconnectRecoveredFromLine) {
+        Clear-SessionReconnectPending -Path $Path
+    }
     if ($reconnectFromLine) {
         Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
         return
@@ -1819,12 +2137,15 @@ function Initialize-SessionFromTail {
             }
 
             if (Is-FinalAnswerSignal -Line $line) {
+                Mark-SessionTerminal -Path $Path -AtUtc $eventUtc
                 $turns = @{}
                 $script:sessionStatus[$Path].ActiveTurns = $turns
                 Clear-SessionApprovalPending -Path $Path
+                Clear-SessionReconnectPending -Path $Path
             }
             if ($line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(function_call_output|custom_tool_call_output)"') {
                 Clear-SessionApprovalPending -Path $Path
+                Clear-SessionReconnectPending -Path $Path
             }
             $obj = $null
             if ($line -match '"type"\s*:\s*"(event_msg|response_item)"') {
@@ -1834,11 +2155,25 @@ function Initialize-SessionFromTail {
                     $obj = $null
                 }
             }
+            if (Is-TerminalActivitySignal -Obj $obj -Line $line) {
+                Mark-SessionTerminal -Path $Path -AtUtc $eventUtc
+            } elseif (Is-WorkActivitySignal -Obj $obj) {
+                Mark-SessionWork -Path $Path -AtUtc $eventUtc
+            }
             if (Is-ApprovalSignal -Obj $obj -Line $line) {
                 Mark-SessionEvent -Path $Path -Approval -AtUtc $eventUtc
             }
-            if (Is-ReconnectingSignal -Obj $obj -Line $line) {
+            $isReconnectRecovered = Is-ReconnectRecoveredSignal -Obj $obj -Line $line
+            $isReconnect = $false
+            if (-not $isReconnectRecovered) {
+                $isReconnect = Is-ReconnectingSignal -Obj $obj -Line $line
+            }
+            if ($isReconnectRecovered) {
+                Clear-SessionReconnectPending -Path $Path
+            } elseif ($isReconnect) {
                 Mark-SessionEvent -Path $Path -Reconnecting -AtUtc $eventUtc
+            } elseif (Is-ReconnectClearActivity -Obj $obj -Line $line) {
+                Clear-SessionReconnectPending -Path $Path
             }
 
             if ($line.IndexOf('"type":"event_msg"', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
@@ -1860,6 +2195,7 @@ function Initialize-SessionFromTail {
             if ($line.IndexOf('"payload":{"type":"task_started"', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                 $line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"task_started"') {
                 $turns[$turnId] = $eventUtc
+                Clear-SessionReconnectPending -Path $Path
                 continue
             }
 
@@ -1870,11 +2206,9 @@ function Initialize-SessionFromTail {
                 $line -match '"payload"\s*:\s*\{\s*"type"\s*:\s*"(task_complete|turn_aborted|task_failed|task_cancelled)"') {
                 if ($turns.ContainsKey($turnId)) {
                     $turns.Remove($turnId) | Out-Null
-                } else {
-                    $turns = @{}
-                    $script:sessionStatus[$Path].ActiveTurns = $turns
                 }
                 Clear-SessionApprovalPending -Path $Path
+                Clear-SessionReconnectPending -Path $Path
                 continue
             }
         }
@@ -1930,25 +2264,7 @@ function Get-CodexAgentCount {
         $processCount = 0
     }
 
-    $freshSessionCount = 0
-    try {
-        Refresh-SessionSnapshot
-        if ($script:recentSessionInfos.Count -gt 0) {
-            $freshSessionCount = @(
-                $script:recentSessionInfos |
-                    Where-Object { (([DateTime]::UtcNow - ([DateTime]$_.LastWriteTimeUtc).ToUniversalTime()).TotalSeconds -le 3600.0) } |
-                    Select-Object -First 12
-            ).Count
-        }
-    } catch {
-        $freshSessionCount = 0
-    }
-
-    # New codex process should create a card immediately even before thread mapping appears.
     $count = [Math]::Max($activeCount, $processCount)
-    if ($freshSessionCount -gt $count) {
-        $count = $freshSessionCount
-    }
     if ($count -eq 0 -and $script:currentState -ne "idle") {
         $count = 1
     }
@@ -1969,30 +2285,54 @@ function Get-SessionStateInfo {
     $approvalHoldSec = [Math]::Max(90.0, $IdleSeconds * 20.0)
     $approvalPendingMaxSec = [Math]::Max(21600.0, $IdleSeconds * 14400.0)
     $approvalActiveTurnGuardSec = [Math]::Max(300.0, $IdleSeconds * 300.0)
-    $reconnectHoldSec = [Math]::Max(45.0, $IdleSeconds * 30.0)
+    $reconnectPendingMaxSec = [Math]::Max(43200.0, $IdleSeconds * 21600.0)
+    $reconnectRecentHoldSec = [Math]::Max(90.0, $IdleSeconds * 45.0)
     $runningWindowSec = [Math]::Max(30.0, $IdleSeconds * 20.0)
+    $stickyWorkMaxSilenceSec = [Math]::Max(7200.0, $IdleSeconds * 4800.0)
     $status = $null
     if ($script:sessionStatus.ContainsKey($Path)) {
         $status = $script:sessionStatus[$Path]
     }
 
     $hasActiveTurn = $false
-    $activeStartUtc = [DateTime]::MinValue
+    $hasStickyWork = $false
     $lastWriteUtc = ([DateTime]$LastWriteTimeUtc).ToUniversalTime()
     $writeAgeSec = ($now - $lastWriteUtc).TotalSeconds
     $activeTurnMaxSilenceSec = [Math]::Max(7200.0, $IdleSeconds * 4800.0)
     if ($status -and $null -ne $status.ActiveTurns -and $status.ActiveTurns.Count -gt 0) {
-        if ($writeAgeSec -le $activeTurnMaxSilenceSec) {
-            $hasActiveTurn = $true
-            $activeStartUtc = [DateTime]::UtcNow
-            foreach ($k in @($status.ActiveTurns.Keys)) {
-                $dt = [DateTime]$status.ActiveTurns[$k]
-                if ($dt -lt $activeStartUtc) {
-                    $activeStartUtc = $dt
-                }
+        $cutoffUtc = [DateTime]::MinValue
+        if ($status.LastTerminalUtc -ne [DateTime]::MinValue) {
+            $cutoffUtc = $status.LastTerminalUtc
+        }
+        $keptTurns = @{}
+        foreach ($k in @($status.ActiveTurns.Keys)) {
+            $dt = [DateTime]$status.ActiveTurns[$k]
+            if ($cutoffUtc -ne [DateTime]::MinValue -and $dt -le $cutoffUtc) {
+                continue
             }
-        } else {
-            $status.ActiveTurns = @{}
+            $keptTurns[$k] = $dt
+        }
+        $status.ActiveTurns = $keptTurns
+        if ($status.ActiveTurns.Count -gt 0) {
+            if ($writeAgeSec -le $activeTurnMaxSilenceSec) {
+                $hasActiveTurn = $true
+            } else {
+                $status.ActiveTurns = @{}
+            }
+        }
+    }
+
+    if ($status -and $status.LastWorkUtc -ne [DateTime]::MinValue) {
+        $workStillOpen = ($status.LastTerminalUtc -eq [DateTime]::MinValue -or $status.LastWorkUtc -gt $status.LastTerminalUtc)
+        if ($workStillOpen) {
+            $workSignalUtc = $status.LastWorkUtc
+            if ($lastWriteUtc -gt $workSignalUtc) {
+                $workSignalUtc = $lastWriteUtc
+            }
+            $workAgeSec = ($now - $workSignalUtc).TotalSeconds
+            if ($workAgeSec -le $stickyWorkMaxSilenceSec) {
+                $hasStickyWork = $true
+            }
         }
     }
 
@@ -2017,9 +2357,21 @@ function Get-SessionStateInfo {
         }
     }
 
+    if ($status -and $status.ReconnectPending) {
+        $reconnectAge = ($now - $status.LastReconnectUtc).TotalSeconds
+        if ($writeAgeSec -le $reconnectPendingMaxSec) {
+            return [PSCustomObject]@{
+                State = "reconnecting"
+                AgeSec = [int][Math]::Floor([Math]::Max(0.0, $reconnectAge))
+            }
+        } else {
+            $status.ReconnectPending = $false
+        }
+    }
+
     if ($status -and $status.LastReconnectUtc -ne [DateTime]::MinValue) {
         $reconnectAge = ($now - $status.LastReconnectUtc).TotalSeconds
-        if ($reconnectAge -le $reconnectHoldSec) {
+        if ($reconnectAge -le $reconnectRecentHoldSec) {
             return [PSCustomObject]@{
                 State = "reconnecting"
                 AgeSec = [int][Math]::Floor([Math]::Max(0.0, $reconnectAge))
@@ -2027,7 +2379,9 @@ function Get-SessionStateInfo {
         }
     }
 
-    if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue -and -not $hasActiveTurn) {
+    $hasOngoingWork = ($hasActiveTurn -or $hasStickyWork)
+
+    if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue -and -not $hasOngoingWork) {
         $approvalAge = ($now - $status.LastApprovalUtc).TotalSeconds
         if ($approvalAge -le $approvalHoldSec) {
             return [PSCustomObject]@{
@@ -2037,7 +2391,7 @@ function Get-SessionStateInfo {
         }
     }
 
-    if ($hasActiveTurn) {
+    if ($hasOngoingWork) {
         if ($status -and $status.LastApprovalUtc -ne [DateTime]::MinValue) {
             $approvalAgeForActive = ($now - $status.LastApprovalUtc).TotalSeconds
             if ($approvalAgeForActive -le $approvalActiveTurnGuardSec -and $age -gt $runningWindowSec) {
@@ -2086,7 +2440,7 @@ function Get-CardModels {
         $activePathSet[[string]$k] = $true
     }
 
-    $visibleWindowSec = 21600.0
+    $bootstrapVisibleWindowSec = 45.0
     $candidateInfos = @(
         $script:recentSessionInfos |
             Where-Object {
@@ -2095,11 +2449,23 @@ function Get-CardModels {
                 if (-not [string]::IsNullOrWhiteSpace($np) -and $activePathSet.ContainsKey($np)) {
                     return $true
                 }
-                $ageSec = ($nowUtc - ([DateTime]$_.LastWriteTimeUtc).ToUniversalTime()).TotalSeconds
-                if ($ageSec -le $visibleWindowSec) {
-                    return $true
+                if ($script:sessionStatus.ContainsKey($p)) {
+                    $st = $script:sessionStatus[$p]
+                    if ($st) {
+                        if ($null -ne $st.ActiveTurns -and $st.ActiveTurns.Count -gt 0) {
+                            return $true
+                        }
+                        if ($st.ApprovalPending -or $st.ReconnectPending) {
+                            return $true
+                        }
+                        if ($st.LastWorkUtc -ne [DateTime]::MinValue -and
+                            ($st.LastTerminalUtc -eq [DateTime]::MinValue -or $st.LastWorkUtc -gt $st.LastTerminalUtc)) {
+                            return $true
+                        }
+                    }
                 }
-                if ($script:sessionStatus.ContainsKey($p) -and $null -ne $script:sessionStatus[$p].ActiveTurns -and $script:sessionStatus[$p].ActiveTurns.Count -gt 0) {
+                $ageSec = ($nowUtc - ([DateTime]$_.LastWriteTimeUtc).ToUniversalTime()).TotalSeconds
+                if ($ageSec -le $bootstrapVisibleWindowSec) {
                     return $true
                 }
                 return $false
@@ -2824,57 +3190,248 @@ function Get-CardAnchorInfo {
     }
 }
 
+function Get-RoundedGraphicsPath {
+    param(
+        [System.Drawing.Rectangle] $Rect,
+        [int] $Radius = 8
+    )
+
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $r = [Math]::Max(1, $Radius)
+    $d = [Math]::Max(2, $r * 2)
+    if ($Rect.Width -le ($d + 2) -or $Rect.Height -le ($d + 2)) {
+        $path.AddRectangle($Rect)
+        return $path
+    }
+
+    $arc = New-Object System.Drawing.Rectangle($Rect.X, $Rect.Y, $d, $d)
+    $path.AddArc($arc, 180, 90)
+    $arc.X = $Rect.Right - $d
+    $path.AddArc($arc, 270, 90)
+    $arc.Y = $Rect.Bottom - $d
+    $path.AddArc($arc, 0, 90)
+    $arc.X = $Rect.Left
+    $path.AddArc($arc, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+function Set-ControlRoundedRegion {
+    param(
+        [System.Windows.Forms.Control] $Control,
+        [int] $Radius = 8
+    )
+
+    if (-not $Control) {
+        return
+    }
+    if ($Control.Width -le 1 -or $Control.Height -le 1) {
+        return
+    }
+
+    $path = $null
+    $newRegion = $null
+    $oldRegion = $null
+    try {
+        $rect = New-Object System.Drawing.Rectangle(0, 0, [int]$Control.Width, [int]$Control.Height)
+        $path = Get-RoundedGraphicsPath -Rect $rect -Radius $Radius
+        $newRegion = New-Object System.Drawing.Region($path)
+        try { $oldRegion = $Control.Region } catch { $oldRegion = $null }
+        $Control.Region = $newRegion
+        $newRegion = $null
+        if ($oldRegion) {
+            try { $oldRegion.Dispose() } catch {}
+        }
+    } catch {
+    } finally {
+        if ($newRegion) {
+            try { $newRegion.Dispose() } catch {}
+        }
+        if ($path) {
+            try { $path.Dispose() } catch {}
+        }
+    }
+}
+
+function Set-CardSpeechBubbleLayout {
+    param(
+        [object] $Card,
+        [string] $SpeechText
+    )
+
+    if (-not $Card -or -not $Card.Form -or -not $Card.Bubble -or -not $Card.Picture -or -not $Card.Label) {
+        return $false
+    }
+
+    $cardWidth = 156
+    $cardMinHeight = 126
+    $cardMaxHeight = 206
+    $bubbleMinHeight = 24
+    $bubbleMaxHeight = 112
+    $tailHeight = 6
+    $footerHeight = 14
+    $pictureHeight = 73
+
+    try { if ($Card.PSObject.Properties.Name -contains "CardWidth") { $cardWidth = [int]$Card.CardWidth } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "CardMinHeight") { $cardMinHeight = [int]$Card.CardMinHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "CardMaxHeight") { $cardMaxHeight = [int]$Card.CardMaxHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "BubbleMinHeight") { $bubbleMinHeight = [int]$Card.BubbleMinHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "BubbleMaxHeight") { $bubbleMaxHeight = [int]$Card.BubbleMaxHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "TailHeight") { $tailHeight = [int]$Card.TailHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "FooterHeight") { $footerHeight = [int]$Card.FooterHeight } } catch {}
+    try { if ($Card.PSObject.Properties.Name -contains "PictureHeight") { $pictureHeight = [int]$Card.PictureHeight } } catch {}
+
+    if ($cardMaxHeight -lt $cardMinHeight) { $cardMaxHeight = $cardMinHeight }
+    if ($bubbleMaxHeight -lt $bubbleMinHeight) { $bubbleMaxHeight = $bubbleMinHeight }
+    if ($pictureHeight -lt 24) { $pictureHeight = 24 }
+
+    $text = Normalize-SpeechText -Text $SpeechText
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = "..."
+    }
+
+    $bubbleWidth = [Math]::Max(36, $cardWidth)
+    $innerWidth = [Math]::Max(24, $bubbleWidth - 10)
+    $desiredBubbleHeight = $bubbleMinHeight
+    $g = $null
+    $fmt = $null
+    try {
+        $g = $Card.Bubble.CreateGraphics()
+        $fmt = New-Object System.Drawing.StringFormat
+        $fmt.Trimming = [System.Drawing.StringTrimming]::Word
+        $sizeF = $g.MeasureString($text, $Card.Bubble.Font, $innerWidth, $fmt)
+        $desiredBubbleHeight = [int][Math]::Ceiling([double]$sizeF.Height + 8.0)
+    } catch {
+        $desiredBubbleHeight = $bubbleMinHeight
+    } finally {
+        if ($fmt) { $fmt.Dispose() }
+        if ($g) { $g.Dispose() }
+    }
+    if ($desiredBubbleHeight -lt $bubbleMinHeight) { $desiredBubbleHeight = $bubbleMinHeight }
+    $bubbleHeight = [Math]::Min($bubbleMaxHeight, $desiredBubbleHeight)
+
+    $desiredCardHeight = $bubbleHeight + $tailHeight + $footerHeight + $pictureHeight
+    $cardHeight = [Math]::Max($cardMinHeight, $desiredCardHeight)
+    $cardHeight = [Math]::Min($cardMaxHeight, $cardHeight)
+
+    $layoutChanged = $false
+    if ([int]$Card.Form.Width -ne $cardWidth -or [int]$Card.Form.Height -ne $cardHeight) {
+        $Card.Form.Size = New-Object System.Drawing.Size($cardWidth, $cardHeight)
+        $layoutChanged = $true
+    }
+
+    $bubbleRectChanged = ([int]$Card.Bubble.Left -ne 0 -or [int]$Card.Bubble.Top -ne 0 -or [int]$Card.Bubble.Width -ne $bubbleWidth -or [int]$Card.Bubble.Height -ne $bubbleHeight)
+    if ($bubbleRectChanged) {
+        $Card.Bubble.SetBounds(0, 0, $bubbleWidth, $bubbleHeight)
+        $layoutChanged = $true
+    }
+    if ($bubbleRectChanged -or $null -eq $Card.Bubble.Region) {
+        Set-ControlRoundedRegion -Control $Card.Bubble -Radius 8
+    }
+
+    if ($Card.PSObject.Properties.Name -contains "BubbleTail" -and $Card.BubbleTail) {
+        $tailRectChanged = ([int]$Card.BubbleTail.Left -ne 0 -or [int]$Card.BubbleTail.Top -ne $bubbleHeight -or [int]$Card.BubbleTail.Width -ne $cardWidth -or [int]$Card.BubbleTail.Height -ne $tailHeight)
+        if ($tailRectChanged) {
+            $Card.BubbleTail.SetBounds(0, $bubbleHeight, $cardWidth, $tailHeight)
+            $layoutChanged = $true
+        }
+    }
+
+    $pictureTop = $bubbleHeight + $tailHeight
+    $pictureRectChanged = ([int]$Card.Picture.Left -ne 0 -or [int]$Card.Picture.Top -ne $pictureTop -or [int]$Card.Picture.Width -ne $cardWidth -or [int]$Card.Picture.Height -ne $pictureHeight)
+    if ($pictureRectChanged) {
+        $Card.Picture.SetBounds(0, $pictureTop, $cardWidth, $pictureHeight)
+        $layoutChanged = $true
+    }
+
+    $labelTop = $bubbleHeight + $tailHeight + $pictureHeight
+    $labelRectChanged = ([int]$Card.Label.Left -ne 0 -or [int]$Card.Label.Top -ne $labelTop -or [int]$Card.Label.Width -ne $cardWidth -or [int]$Card.Label.Height -ne $footerHeight)
+    if ($labelRectChanged) {
+        $Card.Label.SetBounds(0, $labelTop, $cardWidth, $footerHeight)
+        $layoutChanged = $true
+    }
+
+    $currentBubbleText = ""
+    try { $currentBubbleText = [string]$Card.Bubble.AccessibleDescription } catch { $currentBubbleText = "" }
+    if ($currentBubbleText -ne $text) {
+        $Card.Bubble.AccessibleDescription = $text
+        $Card.Bubble.Text = ""
+        try { $Card.Bubble.Invalidate() } catch {}
+    }
+    return $layoutChanged
+}
+
 function New-Card {
     param([int] $Index)
 
     $cardWidth = 156
-    $cardHeight = 126
-    $bubbleHeight = 34
-    $tailHeight = 7
-    $footerHeight = 12
-    $pictureHeight = [Math]::Max(24, $cardHeight - $bubbleHeight - $tailHeight - $footerHeight)
+    $cardMinHeight = 126
+    $cardMaxHeight = 206
+    $bubbleMinHeight = 24
+    $bubbleMaxHeight = 112
+    $tailHeight = 6
+    $footerHeight = 14
+    $pictureHeight = [Math]::Max(24, $cardMinHeight - $bubbleMinHeight - $tailHeight - $footerHeight)
+    $transparentKey = [System.Drawing.Color]::FromArgb(1, 1, 1)
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "codex - confirwa"
     $form.Width = $cardWidth
-    $form.Height = $cardHeight
+    $form.Height = $cardMinHeight
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $form.TopMost = $true
     $form.ShowInTaskbar = $false
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
     $form.ControlBox = $false
-    $form.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 24)
+    $form.BackColor = $transparentKey
+    $form.TransparencyKey = $transparentKey
 
     $picture = New-Object System.Windows.Forms.PictureBox
-    $picture.SetBounds(0, $bubbleHeight + $tailHeight, $cardWidth, $pictureHeight)
+    $picture.SetBounds(0, $bubbleMinHeight + $tailHeight, $cardWidth, $pictureHeight)
     $picture.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
-    $picture.BackColor = [System.Drawing.Color]::Black
+    $picture.BackColor = $transparentKey
 
     $bubble = New-Object System.Windows.Forms.Label
-    $bubble.SetBounds(2, 0, $cardWidth - 4, $bubbleHeight)
-    $bubble.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $bubble.ForeColor = [System.Drawing.Color]::FromArgb(20, 24, 30)
-    $bubble.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
-    $bubble.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $bubble.Padding = New-Object System.Windows.Forms.Padding(6, 1, 6, 1)
-    $bubble.AutoEllipsis = $false
-    $bubble.Font = New-Object System.Drawing.Font("Segoe UI", 8.1, [System.Drawing.FontStyle]::Regular)
-    $bubble.Text = "..."
+    $bubble.SetBounds(0, 0, $cardWidth, $bubbleMinHeight)
+    $bubble.ForeColor = [System.Drawing.Color]::Transparent
+    $bubble.BackColor = [System.Drawing.Color]::Transparent
+    $bubble.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $bubble.AutoSize = $false
+    $bubble.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
+    $bubble.Padding = New-Object System.Windows.Forms.Padding(5, 2, 5, 1)
+    $bubble.UseCompatibleTextRendering = $false
+    try {
+        $bubble.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5, [System.Drawing.FontStyle]::Bold)
+    } catch {
+        $bubble.Font = New-Object System.Drawing.Font("Segoe UI", 8.3, [System.Drawing.FontStyle]::Bold)
+    }
+    $bubble.Text = ""
+    $bubble.AccessibleDescription = "..."
 
     $bubbleTail = New-Object System.Windows.Forms.Label
-    $bubbleTail.SetBounds(0, $bubbleHeight, $cardWidth, $tailHeight)
+    $bubbleTail.SetBounds(0, $bubbleMinHeight, $cardWidth, $tailHeight)
     $bubbleTail.TextAlign = [System.Drawing.ContentAlignment]::TopCenter
-    $bubbleTail.ForeColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
-    $bubbleTail.BackColor = [System.Drawing.Color]::FromArgb(18, 20, 24)
-    $bubbleTail.Font = New-Object System.Drawing.Font("Segoe UI", 7.0, [System.Drawing.FontStyle]::Regular)
-    $bubbleTail.Text = "▼"
+    $bubbleTail.ForeColor = [System.Drawing.Color]::Transparent
+    $bubbleTail.BackColor = [System.Drawing.Color]::Transparent
+    $bubbleTail.Text = ""
 
     $label = New-Object System.Windows.Forms.Label
-    $label.SetBounds(0, $bubbleHeight + $tailHeight + $pictureHeight, $cardWidth, $footerHeight)
+    $label.SetBounds(0, $bubbleMinHeight + $tailHeight + $pictureHeight, $cardWidth, $footerHeight)
     $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.ForeColor = [System.Drawing.Color]::White
-    $label.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-    $label.Text = "codex: idle"
+    $label.ForeColor = [System.Drawing.Color]::Transparent
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    $label.UseCompatibleTextRendering = $false
+    $label.AutoEllipsis = $false
+    $label.Text = ""
+    $label.AccessibleDescription = "codex: idle"
+    try {
+        $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.2, [System.Drawing.FontStyle]::Regular)
+    } catch {
+        try {
+            $label.Font = New-Object System.Drawing.Font("Segoe UI", 8.2, [System.Drawing.FontStyle]::Regular)
+        } catch {
+        }
+    }
 
     $mouseHandler = {
         param($sender, $e)
@@ -2897,6 +3454,116 @@ function New-Card {
     $dragUpHandler = {
         param($sender, $e)
         End-CardDrag -Sender $sender -EventArgs $e
+    }
+    $bubblePaintHandler = {
+        param($sender, $e)
+        if (-not $sender -or -not $e) {
+            return
+        }
+        $path = $null
+        $fillBrush = $null
+        $pen = $null
+        $fmt = $null
+        $textBrush = $null
+        try {
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $e.Graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+            $rect = New-Object System.Drawing.Rectangle(1, 1, [Math]::Max(2, $sender.Width - 3), [Math]::Max(2, $sender.Height - 3))
+            $path = Get-RoundedGraphicsPath -Rect $rect -Radius 8
+            $fillBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 253, 247))
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(46, 48, 54), 2.0)
+            $e.Graphics.FillPath($fillBrush, $path)
+            $e.Graphics.DrawPath($pen, $path)
+
+            $txt = ""
+            try { $txt = [string]$sender.AccessibleDescription } catch { $txt = "" }
+            if (-not [string]::IsNullOrWhiteSpace($txt)) {
+                $fmt = New-Object System.Drawing.StringFormat
+                $fmt.Alignment = [System.Drawing.StringAlignment]::Near
+                $fmt.LineAlignment = [System.Drawing.StringAlignment]::Near
+                $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
+                $textBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(24, 26, 30))
+                $textRect = New-Object System.Drawing.RectangleF(6.0, 2.0, [Math]::Max(1.0, ($sender.Width - 12.0)), [Math]::Max(1.0, ($sender.Height - 4.0)))
+                $e.Graphics.DrawString($txt, $sender.Font, $textBrush, $textRect, $fmt)
+            }
+        } catch {
+        } finally {
+            if ($textBrush) { $textBrush.Dispose() }
+            if ($fmt) { $fmt.Dispose() }
+            if ($fillBrush) { $fillBrush.Dispose() }
+            if ($pen) { $pen.Dispose() }
+            if ($path) { $path.Dispose() }
+        }
+    }
+    $bubbleTailPaintHandler = {
+        param($sender, $e)
+        if (-not $sender -or -not $e) {
+            return
+        }
+        $fillBrush = $null
+        $pen = $null
+        try {
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $w = [int]$sender.Width
+            $h = [int]$sender.Height
+            if ($w -le 4 -or $h -le 1) {
+                return
+            }
+            $cx = [int][Math]::Floor($w / 2)
+            $half = [int][Math]::Max(3, [Math]::Floor($h * 0.95))
+            $baseY = 0
+            $tipY = [int]([Math]::Max(1, $h - 1))
+            $points = [System.Drawing.Point[]]@(
+                (New-Object System.Drawing.Point(($cx - $half), $baseY)),
+                (New-Object System.Drawing.Point(($cx + $half), $baseY)),
+                (New-Object System.Drawing.Point($cx, $tipY))
+            )
+            $fillBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 253, 247))
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(46, 48, 54), 1.0)
+            $e.Graphics.FillPolygon($fillBrush, $points)
+            $e.Graphics.DrawPolygon($pen, $points)
+        } catch {
+        } finally {
+            if ($pen) { $pen.Dispose() }
+            if ($fillBrush) { $fillBrush.Dispose() }
+        }
+    }
+    $labelPaintHandler = {
+        param($sender, $e)
+        if (-not $sender -or -not $e) {
+            return
+        }
+        $txt = ""
+        try {
+            $txt = [string]$sender.AccessibleDescription
+        } catch {
+            $txt = ""
+        }
+        if ([string]::IsNullOrWhiteSpace($txt)) {
+            try { $txt = [string]$sender.Text } catch { $txt = "" }
+        }
+        if ([string]::IsNullOrWhiteSpace($txt)) {
+            return
+        }
+
+        $fmt = $null
+        $brush = $null
+        try {
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+            $e.Graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
+            $fmt = New-Object System.Drawing.StringFormat
+            $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+            $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+            $fmt.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(194, 202, 214))
+            $r = $sender.ClientRectangle
+            $textRect = New-Object System.Drawing.RectangleF($r.X, $r.Y, $r.Width, $r.Height)
+            $e.Graphics.DrawString($txt, $sender.Font, $brush, $textRect, $fmt)
+        } finally {
+            if ($brush) { $brush.Dispose() }
+            if ($fmt) { $fmt.Dispose() }
+        }
     }
     $form.Tag = [int]$Index
     $picture.Tag = [int]$Index
@@ -2923,6 +3590,9 @@ function New-Card {
     $bubble.Add_MouseUp($dragUpHandler)
     $bubbleTail.Add_MouseUp($dragUpHandler)
     $label.Add_MouseUp($dragUpHandler)
+    $bubble.Add_Paint($bubblePaintHandler)
+    $bubbleTail.Add_Paint($bubbleTailPaintHandler)
+    $label.Add_Paint($labelPaintHandler)
 
     $form.Controls.Add($picture)
     $form.Controls.Add($bubbleTail)
@@ -2940,8 +3610,18 @@ function New-Card {
         Title = "codex"
         State = "idle"
         Speech = "..."
+        CardWidth = [int]$cardWidth
+        CardMinHeight = [int]$cardMinHeight
+        CardMaxHeight = [int]$cardMaxHeight
+        BubbleMinHeight = [int]$bubbleMinHeight
+        BubbleMaxHeight = [int]$bubbleMaxHeight
+        TailHeight = [int]$tailHeight
+        FooterHeight = [int]$footerHeight
+        PictureHeight = [int]$pictureHeight
         ModelKey = ("__empty_{0}" -f $Index)
     }
+    [void](Set-CardSpeechBubbleLayout -Card $script:cards[$Index] -SpeechText "...")
+    Set-ControlRoundedRegion -Control $bubble -Radius 8
     [void]$form.Show()
 }
 
@@ -2974,16 +3654,100 @@ function Update-CardLayout {
     $targetArea = [System.Drawing.Rectangle]$anchor.Area
     $startX = [int]$anchor.X
     $startY = [int]$anchor.Y
-    $usableWidth = [Math]::Max($cardWidth + $gap, $targetArea.Right - $startX - $gap)
-    $perRow = [Math]::Max(1, [Math]::Floor($usableWidth / ($cardWidth + $gap)))
+    $maxPerRow = [Math]::Max(1, [Math]::Floor(($targetArea.Width + $gap) / ($cardWidth + $gap)))
+    $perRow = [Math]::Min($keys.Count, $maxPerRow)
+    if ($perRow -le 0) {
+        $perRow = 1
+    }
+
+    $rowHeights = @{}
+    $maxRow = 0
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $idx = [int]$keys[$i]
+        $row = [int][Math]::Floor($i / $perRow)
+        if ($row -gt $maxRow) {
+            $maxRow = $row
+        }
+        $h = $cardHeight
+        try {
+            $h = [int]$script:cards[$idx].Form.Height
+        } catch {
+            $h = $cardHeight
+        }
+        if (-not $rowHeights.ContainsKey($row) -or [int]$rowHeights[$row] -lt $h) {
+            $rowHeights[$row] = $h
+        }
+    }
+
+    $rowTop = @{}
+    $cursorY = $startY
+    for ($r = 0; $r -le $maxRow; $r++) {
+        $rowTop[$r] = [int]$cursorY
+        $rh = $cardHeight
+        if ($rowHeights.ContainsKey($r)) {
+            $rh = [int]$rowHeights[$r]
+        }
+        $cursorY += ($rh + $gap)
+    }
+
+    $groupWidth = [int](($perRow * $cardWidth) + (($perRow - 1) * $gap))
+    if ($groupWidth -lt $cardWidth) {
+        $groupWidth = $cardWidth
+    }
+    $groupHeight = 0
+    for ($r = 0; $r -le $maxRow; $r++) {
+        $rh = $cardHeight
+        if ($rowHeights.ContainsKey($r)) {
+            $rh = [int]$rowHeights[$r]
+        }
+        $groupHeight += $rh
+        if ($r -lt $maxRow) {
+            $groupHeight += $gap
+        }
+    }
+
+    $minX = [int]$targetArea.Left
+    $maxX = [int]($targetArea.Right - $groupWidth)
+    if ($maxX -lt $minX) {
+        $maxX = $minX
+    }
+    $startX = [int][Math]::Max($minX, [Math]::Min($maxX, $startX))
+
+    $minY = [int]$targetArea.Top
+    $maxY = [int]($targetArea.Bottom - $groupHeight)
+    if ($maxY -lt $minY) {
+        $maxY = $minY
+    }
+    $startY = [int][Math]::Max($minY, [Math]::Min($maxY, $startY))
+
+    $rowTop = @{}
+    $cursorY = $startY
+    for ($r = 0; $r -le $maxRow; $r++) {
+        $rowTop[$r] = [int]$cursorY
+        $rh = $cardHeight
+        if ($rowHeights.ContainsKey($r)) {
+            $rh = [int]$rowHeights[$r]
+        }
+        $cursorY += ($rh + $gap)
+    }
 
     for ($i = 0; $i -lt $keys.Count; $i++) {
         $idx = [int]$keys[$i]
-        $row = [Math]::Floor($i / $perRow)
-        $col = $i % $perRow
+        $row = [int][Math]::Floor($i / $perRow)
+        $col = [int]($i % $perRow)
+        $rowHeight = $cardHeight
+        if ($rowHeights.ContainsKey($row)) {
+            $rowHeight = [int]$rowHeights[$row]
+        }
+        $itemHeight = $cardHeight
+        try {
+            $itemHeight = [int]$script:cards[$idx].Form.Height
+        } catch {
+            $itemHeight = $cardHeight
+        }
         $pt = New-Object System.Drawing.Point(
             [int]($startX + ($col * ($cardWidth + $gap))),
-            [int]($startY + ($row * ($cardHeight + $gap)))
+            [int]($rowTop[$row] + ($rowHeight - $itemHeight))
         )
         $clamped = Clamp-CardLocation -Point $pt -Size $script:cards[$idx].Form.Size -Area $targetArea
         $script:cards[$idx].Form.Location = $clamped
@@ -3019,6 +3783,7 @@ function Apply-CardVisuals {
     param([object[]] $Models)
 
     $keys = @($script:cards.Keys | Sort-Object)
+    $needsRelayout = $false
     for ($i = 0; $i -lt $keys.Count; $i++) {
         $idx = [int]$keys[$i]
         $card = $script:cards[$idx]
@@ -3082,16 +3847,26 @@ function Apply-CardVisuals {
         if ([string]::IsNullOrWhiteSpace($speech)) {
             $speech = "..."
         }
+        $layoutChanged = Set-CardSpeechBubbleLayout -Card $card -SpeechText $speech
+        if ($layoutChanged) {
+            $needsRelayout = $true
+        }
         if ($card.Speech -ne $speech) {
-            $card.Bubble.Text = $speech
             $card.Speech = $speech
         }
 
         $labelText = "[{0}] {1}: {2}" -f $hotkeyIndex, $title, (Get-StateText $state)
-        if ($card.Label.Text -ne $labelText) {
-            $card.Label.Text = $labelText
+        $currentLabelText = ""
+        try { $currentLabelText = [string]$card.Label.AccessibleDescription } catch { $currentLabelText = "" }
+        if ($currentLabelText -ne $labelText) {
+            $card.Label.AccessibleDescription = $labelText
+            $card.Label.Text = ""
+            try { $card.Label.Invalidate() } catch {}
         }
         $card.State = $state
+    }
+    if ($needsRelayout) {
+        Update-CardLayout
     }
 }
 
